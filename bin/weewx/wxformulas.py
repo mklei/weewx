@@ -830,6 +830,11 @@ def evapotranspiration_US(Tmin_F, Tmax_F, rh_min, rh_max,
                                     timestamp=timestamp)
     return evt / MM_PER_INCH if evt is not None else None
 
+def absHumidity(T, rh):
+    absHum = (6.112 * math.exp( (17.67*T)/(T+243.5) ) * rh * 2.1674) / (273.15+T)
+    return absHum
+
+
 if __name__ == "__main__":
     
     import doctest
