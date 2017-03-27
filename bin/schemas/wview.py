@@ -67,4 +67,6 @@ schema = [('dateTime',             'INTEGER NOT NULL UNIQUE PRIMARY KEY'),
           ('windBatteryStatus',    'REAL'),
           ('rainBatteryStatus',    'REAL'),
           ('outTempBatteryStatus', 'REAL'),
-          ('inTempBatteryStatus',  'REAL')]
+          ('inTempBatteryStatus',  'REAL'),
+          ('inDewpoint',           'REAL')]
+
