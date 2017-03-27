@@ -81,6 +81,9 @@ import time
 import urllib
 import urllib2
 
+import requests
+import datetime
+
 import weedb
 import weeutil.weeutil
 import weewx.engine
@@ -1713,3 +1716,214 @@ def get_site_dict(config_dict, service, *args):
 
 # For backward compatibility pre 3.6.0
 check_enable = get_site_dict
+
+# *******************************************************************
+# *******************************************************************
+# *******************************************************************
+# NEW NEW NEW NEW NEW NEW NEW NEW NEW NEW NEW NEW NEW NEW NEW NEW NEW
+# *******************************************************************
+# *******************************************************************
+# *******************************************************************
+
+class StdIUTSmartWater(StdRESTful):
+    """Upload to IUT Smart Water Server http://web01-c815.uibk.ac.at/SmartWater/api/ui/
+    To enable this module, add the following to weewx.conf and define wich parameter are written to which sensor 
+    id = 0 means, no transfer
+
+    [StdRESTful]
+        [[IUTSmartWater]]
+	enable = true
+        server_url = http://web01-c815.uibk.ac.at/SmartWater/api/sensor/data/
+        key = addkeyhere
+        [[[Sensors]]]
+           outTemp = 7
+           outHumidity = 8
+           dayRain = 0
+           windSpeed =0
+           windGust = 0
+           barometer = 9
+           rainRate = 10
+    """
+
+    def __init__(self, engine, config_dict):
+        super(StdIUTSmartWater, self).__init__(engine, config_dict)
+        
+        sensors_dict = config_dict['StdRESTful']['IUTSmartWater']['Sensors']
+        if sensors_dict is None:
+            return
+        site_dict = get_site_dict(
+            config_dict, 'IUTSmartWater', 'server_url', 'key')
+        if site_dict is None:
+            return
+        #syslog.syslog(syslog.LOG_INFO, "restx: IUTSmartWater Debug dict length: %d" % len(site_dict))
+
+        site_dict.setdefault('latitude', engine.stn_info.latitude_f)
+        site_dict.setdefault('longitude', engine.stn_info.longitude_f)
+
+        site_dict['manager_dict'] = weewx.manager.get_manager_dict_from_config(
+            config_dict, 'wx_binding')
+        
+        self.archive_queue = Queue.Queue()
+        self.archive_thread = IUTSmartWaterThread(self.archive_queue, sensors_dict, **site_dict)
+        self.archive_thread.start()
+        self.bind(weewx.NEW_ARCHIVE_RECORD, self.new_archive_record)
+        syslog.syslog(syslog.LOG_INFO, "restx: IUTSmartWater: "
+                      "Data will be uploaded to %s" %
+                      site_dict['server_url'])
+
+    def new_archive_record(self, event):
+        self.archive_queue.put(event.record)
+
+
+class IUTSmartWaterThread(RESTThread):
+
+    #_SERVER_URL = 'http://web01-c815.uibk.ac.at/SmartWater/api/sensor/data/'
+    _FORMATS = {'barometer'   : '%.3f',
+                'outTemp'     : '%.1f',
+                'outHumidity' : '%.0f',
+                'windSpeed'   : '%.1f',
+                'windDir'     : '%.0f',
+                'windGust'    : '%.1f',
+                'dewpoint'    : '%.1f',
+                'hourRain'    : '%.2f',
+                'dayRain'     : '%.2f',
+                'radiation'   : '%.2f',
+                'UV'          : '%.2f',
+                'rainRate'    : '%.2f',
+                'rain'    : '%.2f'}
+
+    def __init__(self, queue, sensors_dict, key, server_url, latitude, longitude,
+                 manager_dict, 
+                 skip_upload=False,
+                 post_interval=60, max_backlog=sys.maxint, stale=None,
+                 log_success=True, log_failure=True, 
+                 timeout=60, max_tries=3, retry_wait=5):
+        """Initialize an instances of IUTSmartWaterThread.
+
+        Parameters specific to this class:
+          key: API key
+          sensorid: sensor ID
+          latitude: Station latitude in decimal degrees
+          Default is station latitude
+          manager_dict: A dictionary holding the database manager information. It will be used to open a connection to the archive database.
+          server_url: URL of the server
+
+        Parameters customized for this class:
+          post_interval: The interval in seconds between posts. Default is 300
+        """
+        super(IUTSmartWaterThread, self).__init__(queue,
+                                           protocol_name='IUTSmartWater',
+                                           manager_dict=manager_dict,
+                                           post_interval=post_interval,
+                                           max_backlog=max_backlog,
+                                           stale=stale,
+                                           log_success=log_success,
+                                           log_failure=log_failure,
+                                           timeout=timeout,
+                                           max_tries=max_tries,
+                                           retry_wait=retry_wait)
+        self.server_url = server_url
+        self.key = key
+        self.latitude = float(latitude)
+        self.longitude = float(longitude)
+        self.skip_upload = to_bool(skip_upload)
+        sensors_dict = dict((k,int(v)) for k,v in sensors_dict.iteritems()) # convert string to int
+        self.sensors_dict = {k: v for k, v in sensors_dict.iteritems() if v != 0} # only when values (sensorid) is not 0
+
+    def get_record(self, record, dbmanager):
+        """Ensure that rainRate is in the record."""
+        # Get the record from my superclass
+        r = super(IUTSmartWaterThread, self).get_record(record, dbmanager)
+    
+        # If rain rate is already available, return the record
+        if 'rainRate' in r:
+            return r
+    
+        # Otherwise, augment with rainRate, which AWEKAS expects. If the
+        # archive does not have rainRate, an exception will be raised.
+        # Be prepare to catch it.
+        try:
+            rr = dbmanager.getSql('select rainRate from %s where dateTime=?' %
+                                  dbmanager.table_name, (r['dateTime'],))
+        except weedb.OperationalError:
+            pass
+        else:
+            r['rainRate'] = rr[0]
+        return r
+
+    def process_record(self, record, dbmanager):
+        r = self.get_record(record, dbmanager)
+        url = self.server_url
+        data = self.get_data(r, self.sensors_dict)
+        if self.skip_upload:
+            raise AbortedPost()
+        headers = {'Content-type': 'application/json', 'Accept': 'text/plain', 'api_key': self.key}
+        self.post_IUT(url, data, headers)
+    
+    def post_IUT(self, url, data, headers):
+        syslog.syslog(syslog.LOG_DEBUG, 'restx: IUTSmartWater: data: %s' % data)
+        syslog.syslog(syslog.LOG_DEBUG, 'restx: IUTSmartWater: url: %s' % url)
+        syslog.syslog(syslog.LOG_DEBUG, 'restx: IUTSmartWater: headers: %s' % headers)
+        response = requests.post(url, json=data, headers=headers)
+        syslog.syslog(syslog.LOG_DEBUG, 'restx: IUTSmartWater: response: %s' % response)
+
+    def get_data(self, in_record, sensors_dict):
+        record = weewx.units.to_METRIC(in_record)
+        time_tt = time.gmtime(record['dateTime']) #convert from CET to UTC
+		
+        if 'dayRain' in record and record['dayRain'] is not None:
+           record['dayRain'] *= 10
+        if 'rainRate' in record and record['rainRate'] is not None:
+           record['rainRate'] *= 10
+        sensors_list=sensors_dict.items()
+        data = []
+        for item in sensors_list:
+            data.append({"sensorid": item[1],
+                         "value": float(self._format(record, item[0])),
+                         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.0000Z", time_tt),
+                         "latitude": self.latitude,
+                         "longitude": self.longitude,
+                        })
+            syslog.syslog(syslog.LOG_DEBUG, 'restx: IUTSmartWater: data generation: %s' % data)
+        syslog.syslog(syslog.LOG_DEBUG, 'restx: IUTSmartWater: generated data vector: %s' % data)     
+        return data
+    def get_url(self, in_record):
+        # Convert to metrix units
+        record = weewx.units.to_METRIC(in_record)
+        if 'dayRain' in record and record['dayRain'] is not None:
+           record['dayRain'] *= 10
+        if 'rainRate' in record and record['rainRate'] is not None:
+           record['rainRate'] *= 10
+
+        # assemble an array of values in the proper order
+        values = ['test']
+        time_tt = time.gmtime(record['dateTime'])
+        values.append(time.strftime("%d.%m.%Y", time_tt))
+        values.append(time.strftime("%H:%M", time_tt))
+        values.append(self._format(record, 'outTemp')) # C
+        values.append(self._format(record, 'outHumidity')) # %
+        values.append(self._format(record, 'barometer')) # mbar
+        values.append(self._format(record, 'dayRain')) # mm
+        values.append(self._format(record, 'windSpeed')) # km/h
+        values.append(self._format(record, 'windDir'))
+        values.append(self._format(record, 'windGust')) # km/h
+        values.append(self._format(record, 'rainRate')) # mm/h
+        values.append(str(self.longitude))
+        values.append(str(self.latitude))
+
+        valstr = ';'.join(values)
+        url = self.server_url + '?val=' + valstr
+        # show the url in the logs for debug, but mask any credentials
+        if weewx.debug >= 2:
+            syslog.syslog(syslog.LOG_DEBUG, 'restx: IUTSmartWater: url: %s' % url)
+        return url
+
+    def _format(self, record, label):
+        if label in record and record[label] is not None:
+            if label in self._FORMATS:
+                return self._FORMATS[label] % record[label]
+            return str(record[label])
+        return ''
+
+###############################################################################
+
